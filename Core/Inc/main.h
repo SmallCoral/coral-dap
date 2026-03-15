@@ -67,8 +67,8 @@ void Error_Handler(void);
 #define TDO_GPIO_Port GPIOA
 #define TDI_Pin GPIO_PIN_7
 #define TDI_GPIO_Port GPIOA
-#define KEY_Pin GPIO_PIN_1
-#define KEY_GPIO_Port GPIOB
+#define NRST_Pin GPIO_PIN_1
+#define NRST_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
