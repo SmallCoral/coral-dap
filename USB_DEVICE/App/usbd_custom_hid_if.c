@@ -68,6 +68,12 @@
 #define DAP_TRANSFER_RnW            (1U << 1)
 #define DAP_TRANSFER_A2             (1U << 2)
 #define DAP_TRANSFER_A3             (1U << 3)
+#define DAP_TRANSFER_MATCH_VALUE    (1U << 4)
+#define DAP_TRANSFER_MATCH_MASK     (1U << 5)
+#define DAP_TRANSFER_TIMESTAMP      (1U << 7)
+
+/* DP RDBUFF read request: DP, read, address 0x0C. */
+#define SWD_DP_RDBUFF_READ          (DAP_TRANSFER_RnW | DAP_TRANSFER_A2 | DAP_TRANSFER_A3)
 
 /* ----------------------- Transfer response ACK ----------------------- */
 #define DAP_TRANSFER_OK             0x01U
@@ -85,7 +91,7 @@
 
 /* ----------------------- HID report descriptor ----------------------- */
 /* 64-byte IN / 64-byte OUT vendor HID */
-__ALIGN_BEGIN static uint8_t CUSTOM_HID_ReportDesc_FS[USBD_CUSTOM_HID_REPORT_DESC_SIZE] __ALIGN_END =
+__ALIGN_BEGIN static uint8_t CUSTOM_HID_ReportDesc_FS[] __ALIGN_END =
 {
   0x06, 0x00, 0xFF,  /* Usage Page (Vendor Defined 0xFF00) */
   0x09, 0x01,        /* Usage 1 */
@@ -101,6 +107,9 @@ __ALIGN_BEGIN static uint8_t CUSTOM_HID_ReportDesc_FS[USBD_CUSTOM_HID_REPORT_DES
   0x91, 0x02,        /* Output (Data,Var,Abs) */
   0xC0               /* End Collection */
 };
+
+_Static_assert(sizeof(CUSTOM_HID_ReportDesc_FS) == USBD_CUSTOM_HID_REPORT_DESC_SIZE,
+               "CMSIS-DAP HID report descriptor length mismatch");
 
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
@@ -126,6 +135,7 @@ static uint8_t g_connected_port = DAP_PORT_DISABLED;
 static uint8_t g_idle_cycles = 0U;
 static uint16_t g_wait_retry = 128U;
 static uint16_t g_match_retry = 0U;
+static uint32_t g_match_mask = 0xFFFFFFFFUL;
 static uint8_t g_swd_turnaround = 1U;
 static uint8_t g_swd_data_phase = 0U;
 static uint32_t g_swj_clock_hz = 100000U;
@@ -176,6 +186,19 @@ static void delay_cycles_soft(void)
   for (i = 0U; i < g_delay_loops; ++i)
   {
     __NOP();
+  }
+}
+
+static void delay_us_soft(uint32_t delay_us)
+{
+  /* Approximate 1 us at 48 MHz. This remains usable inside the USB IRQ. */
+  while (delay_us-- != 0U)
+  {
+    volatile uint32_t i;
+    for (i = 0U; i < 8U; ++i)
+    {
+      __NOP();
+    }
   }
 }
 
@@ -242,10 +265,10 @@ static uint8_t tdo_read(void)
 
 static void swclk_cycle(void)
 {
+  swclk_write(0U);
   delay_cycles_soft();
   swclk_write(1U);
   delay_cycles_soft();
-  swclk_write(0U);
 }
 
 static void swd_write_bit(uint8_t bit)
@@ -257,11 +280,11 @@ static void swd_write_bit(uint8_t bit)
 static uint8_t swd_read_bit(void)
 {
   uint8_t bit;
-  delay_cycles_soft();
-  swclk_write(1U);
+
+  swclk_write(0U);
   delay_cycles_soft();
   bit = swdio_read();
-  swclk_write(0U);
+  swclk_write(1U);
   delay_cycles_soft();
   return bit;
 }
@@ -279,7 +302,7 @@ static void swd_line_idle(void)
 {
   swdio_mode_out();
   swdio_write(1U);
-  swclk_write(0U);
+  swclk_write(1U);
 }
 
 static void swd_line_reset(void)
@@ -356,8 +379,9 @@ static uint8_t swd_transfer_word(uint8_t request, uint32_t *data)
       parity = swd_read_bit();
 
       /* Turnaround back to host */
-      swdio_mode_out();
       swd_write_turnaround(g_swd_turnaround);
+      swdio_write(1U);
+      swdio_mode_out();
 
       if ((parity32(value) ^ parity) != 0U)
       {
@@ -365,13 +389,17 @@ static uint8_t swd_transfer_word(uint8_t request, uint32_t *data)
         return DAP_TRANSFER_ERROR;
       }
 
-      *data = value;
+      if (data != NULL)
+      {
+        *data = value;
+      }
     }
     else
     {
       /* Turnaround back to host before write data */
-      swdio_mode_out();
       swd_write_turnaround(g_swd_turnaround);
+      swdio_write(1U);
+      swdio_mode_out();
 
       value = *data;
       for (i = 0U; i < 32U; ++i)
@@ -382,26 +410,71 @@ static uint8_t swd_transfer_word(uint8_t request, uint32_t *data)
     }
 
     /* Idle cycles */
-    swdio_write(1U);
+    swdio_write(0U);
     for (i = 0U; i < g_idle_cycles; ++i)
     {
       swclk_cycle();
     }
 
+    swdio_write(1U);
     swd_line_idle();
     return DAP_TRANSFER_OK;
   }
 
-  /* Recovery on WAIT/FAULT/protocol error */
-  swdio_mode_out();
-  swdio_write(1U);
-  swclk_cycle();
-  swd_line_idle();
-
-  if ((ack != DAP_TRANSFER_WAIT) && (ack != DAP_TRANSFER_FAULT))
+  if ((ack == DAP_TRANSFER_WAIT) || (ack == DAP_TRANSFER_FAULT))
   {
-    return DAP_TRANSFER_ERROR;
+    /* Optional data phase is still clocked while the target owns SWDIO. */
+    if ((g_swd_data_phase != 0U) && ((request & DAP_TRANSFER_RnW) != 0U))
+    {
+      for (i = 0U; i < 33U; ++i)
+      {
+        swclk_cycle();
+      }
+    }
+
+    /* Complete target-to-host turnaround before enabling the output driver. */
+    swd_write_turnaround(g_swd_turnaround);
+    swdio_write(1U);
+    swdio_mode_out();
+
+    if ((g_swd_data_phase != 0U) && ((request & DAP_TRANSFER_RnW) == 0U))
+    {
+      swdio_write(0U);
+      for (i = 0U; i < 33U; ++i)
+      {
+        swclk_cycle();
+      }
+    }
+
+    swdio_write(1U);
+    swd_line_idle();
+    return ack;
   }
+
+  /* Invalid ACK: keep SWDIO released while backing off the possible data phase. */
+  for (i = 0U; i < (uint8_t)(g_swd_turnaround + 33U); ++i)
+  {
+    swclk_cycle();
+  }
+  swdio_write(1U);
+  swdio_mode_out();
+  swd_line_idle();
+  return DAP_TRANSFER_ERROR;
+}
+
+static uint8_t swd_transfer_retry(uint8_t request, uint32_t *data)
+{
+  uint16_t retries = 0U;
+  uint8_t ack;
+
+  do
+  {
+    ack = swd_transfer_word((uint8_t)(request & 0x0FU), data);
+    if (ack != DAP_TRANSFER_WAIT)
+    {
+      break;
+    }
+  } while (retries++ < g_wait_retry);
 
   return ack;
 }
@@ -412,7 +485,9 @@ static uint8_t dap_handle_info(const uint8_t *req, uint8_t *resp)
   static const char vendor[] = "SmallCoral";
   static const char product[] = "DAPLink";
   static const char serial[] = "STM32F042";
-  static const char fwver[] = "0.2";
+  static const char fwver[] = "0.3";
+  static const char target_vendor[] = "STMicroelectronics";
+  static const char target_name[] = "STM32F103CB";
   uint8_t n = 2U;
 
   resp[0] = ID_DAP_Info;
@@ -442,6 +517,18 @@ static uint8_t dap_handle_info(const uint8_t *req, uint8_t *resp)
       resp[1] = (uint8_t)sizeof(fwver);
       memcpy(&resp[2], fwver, sizeof(fwver));
       n = (uint8_t)(2U + sizeof(fwver));
+      break;
+
+    case DAP_INFO_TARGET_VENDOR:
+      resp[1] = (uint8_t)sizeof(target_vendor);
+      memcpy(&resp[2], target_vendor, sizeof(target_vendor));
+      n = (uint8_t)(2U + sizeof(target_vendor));
+      break;
+
+    case DAP_INFO_TARGET_NAME:
+      resp[1] = (uint8_t)sizeof(target_name);
+      memcpy(&resp[2], target_name, sizeof(target_name));
+      n = (uint8_t)(2U + sizeof(target_name));
       break;
 
     case DAP_INFO_CAPABILITIES:
@@ -504,6 +591,7 @@ static uint8_t dap_handle_disconnect(const uint8_t *req, uint8_t *resp)
 {
   (void)req;
   g_connected_port = DAP_PORT_DISABLED;
+  target_nrst_release();
   swd_line_idle();
   resp[0] = ID_DAP_Disconnect;
   resp[1] = DAP_OK;
@@ -523,14 +611,28 @@ static uint8_t dap_handle_transfer_configure(const uint8_t *req, uint8_t *resp)
 
 static uint8_t dap_handle_swj_clock(const uint8_t *req, uint8_t *resp)
 {
+  uint32_t effective_clock_hz;
+
   g_swj_clock_hz = rd_u32(&req[1]);
   if (g_swj_clock_hz == 0U)
   {
-    g_swj_clock_hz = 1000000U;
+    resp[0] = ID_DAP_SWJ_Clock;
+    resp[1] = DAP_ERROR;
+    return 2U;
   }
 
-  /* Crude software delay tuning for 48MHz core */
-  g_delay_loops = (48000000UL / (g_swj_clock_hz * 4UL));
+  /* HAL GPIO bit-bang is intentionally capped for reliable bring-up. */
+  effective_clock_hz = g_swj_clock_hz;
+  if (effective_clock_hz > 1000000UL)
+  {
+    effective_clock_hz = 1000000UL;
+  }
+
+  g_delay_loops = (48000000UL / (effective_clock_hz * 4UL));
+  if (g_delay_loops == 0UL)
+  {
+    g_delay_loops = 1UL;
+  }
   if (g_delay_loops > 255UL)
   {
     g_delay_loops = 255UL;
@@ -545,8 +647,6 @@ static uint8_t dap_handle_swd_configure(const uint8_t *req, uint8_t *resp)
 {
   g_swd_turnaround = (uint8_t)((req[1] & 0x03U) + 1U);
   g_swd_data_phase = (uint8_t)((req[1] >> 2) & 0x01U);
-
-  (void)g_swd_data_phase; /* currently unused, but parsed */
 
   resp[0] = ID_DAP_SWD_Configure;
   resp[1] = DAP_OK;
@@ -603,9 +703,38 @@ static uint8_t dap_handle_swj_pins(const uint8_t *req, uint8_t *resp)
     }
   }
 
-  if (wait_us != 0U)
+  while (wait_us != 0U)
   {
-    HAL_Delay((wait_us + 999U) / 1000U);
+    uint8_t current = 0U;
+
+    if (HAL_GPIO_ReadPin(TCK_GPIO_Port, TCK_Pin) == GPIO_PIN_SET)
+    {
+      current |= DAP_SWJ_SWCLK_TCK;
+    }
+    if (HAL_GPIO_ReadPin(TMS_GPIO_Port, TMS_Pin) == GPIO_PIN_SET)
+    {
+      current |= DAP_SWJ_SWDIO_TMS;
+    }
+    if (HAL_GPIO_ReadPin(TDI_GPIO_Port, TDI_Pin) == GPIO_PIN_SET)
+    {
+      current |= DAP_SWJ_TDI;
+    }
+    if (tdo_read() != 0U)
+    {
+      current |= DAP_SWJ_TDO;
+    }
+    if (HAL_GPIO_ReadPin(NRST_GPIO_Port, NRST_Pin) == GPIO_PIN_SET)
+    {
+      current |= DAP_SWJ_nRESET;
+    }
+
+    if ((current & select) == (value & select))
+    {
+      break;
+    }
+
+    delay_us_soft(1U);
+    --wait_us;
   }
 
   if (HAL_GPIO_ReadPin(TCK_GPIO_Port, TCK_Pin) == GPIO_PIN_SET)
@@ -642,11 +771,7 @@ static uint8_t dap_handle_delay(const uint8_t *req, uint8_t *resp)
 {
   uint16_t delay_us = rd_u16(&req[1]);
 
-  /* Approximation using ms granularity when >0 */
-  if (delay_us != 0U)
-  {
-    HAL_Delay((delay_us + 999U) / 1000U);
-  }
+  delay_us_soft(delay_us);
 
   resp[0] = ID_DAP_Delay;
   resp[1] = DAP_OK;
@@ -658,9 +783,9 @@ static uint8_t dap_handle_reset_target(const uint8_t *req, uint8_t *resp)
   (void)req;
 
   target_nrst_assert();
-  HAL_Delay(20);
+  delay_us_soft(20000U);
   target_nrst_release();
-  HAL_Delay(20);
+  delay_us_soft(20000U);
 
   resp[0] = ID_DAP_ResetTarget;
   resp[1] = DAP_OK;
@@ -673,7 +798,7 @@ static uint8_t dap_handle_write_abort(const uint8_t *req, uint8_t *resp)
   uint32_t value = rd_u32(&req[2]);
   uint8_t ack;
 
-  ack = swd_transfer_word(0x00U /* DP write addr 0x0 */, &value);
+  ack = swd_transfer_retry(0x00U /* DP write addr 0x0 */, &value);
 
   resp[0] = ID_DAP_WriteABORT;
   resp[1] = (ack == DAP_TRANSFER_OK) ? DAP_OK : DAP_ERROR;
@@ -687,6 +812,8 @@ static uint8_t dap_handle_transfer(const uint8_t *req, uint8_t *resp)
   uint8_t transfer_response = DAP_TRANSFER_OK;
   uint8_t req_off = 3U;
   uint8_t rsp_off = 3U;
+  uint8_t post_read = 0U;
+  uint8_t check_write = 0U;
   uint8_t i;
 
   resp[0] = ID_DAP_Transfer;
@@ -697,46 +824,198 @@ static uint8_t dap_handle_transfer(const uint8_t *req, uint8_t *resp)
   {
     uint8_t request = req[req_off++];
     uint32_t data = 0U;
-    uint16_t tries = 0U;
+    uint32_t match_value = 0U;
+    uint16_t match_retries;
+    uint8_t current_ap_posted = 0U;
     uint8_t ack;
 
-    if ((request & DAP_TRANSFER_RnW) == 0U)
+    if ((request & DAP_TRANSFER_TIMESTAMP) != 0U)
+    {
+      transfer_response = DAP_TRANSFER_ERROR;
+      break;
+    }
+
+    if ((request & DAP_TRANSFER_RnW) != 0U)
+    {
+      if ((request & DAP_TRANSFER_MATCH_VALUE) != 0U)
+      {
+        match_value = rd_u32(&req[req_off]);
+        req_off += 4U;
+      }
+    }
+    else
     {
       data = rd_u32(&req[req_off]);
       req_off += 4U;
     }
 
-    do
+    if ((request & DAP_TRANSFER_RnW) != 0U)
     {
-      uint32_t tmp = data;
-      ack = swd_transfer_word(request, &tmp);
-      if ((request & DAP_TRANSFER_RnW) != 0U)
+      if (post_read != 0U)
       {
-        data = tmp;
+        if (((request & DAP_TRANSFER_APnDP) != 0U) &&
+            ((request & DAP_TRANSFER_MATCH_VALUE) == 0U))
+        {
+          /* Return the previous AP result while posting the current AP read. */
+          ack = swd_transfer_retry(request, &data);
+          current_ap_posted = 1U;
+        }
+        else
+        {
+          ack = swd_transfer_retry(SWD_DP_RDBUFF_READ, &data);
+          post_read = 0U;
+        }
+
+        if (ack != DAP_TRANSFER_OK)
+        {
+          transfer_response = ack;
+          break;
+        }
+
+        if (rsp_off > 60U)
+        {
+          transfer_response = DAP_TRANSFER_ERROR;
+          break;
+        }
+        wr_u32(&resp[rsp_off], data);
+        rsp_off += 4U;
       }
-      if (ack == DAP_TRANSFER_WAIT)
+
+      if ((request & DAP_TRANSFER_MATCH_VALUE) != 0U)
       {
-        ++tries;
+        if ((request & DAP_TRANSFER_APnDP) != 0U)
+        {
+          ack = swd_transfer_retry(request, NULL);
+          if (ack != DAP_TRANSFER_OK)
+          {
+            transfer_response = ack;
+            break;
+          }
+        }
+
+        match_retries = 0U;
+        do
+        {
+          ack = swd_transfer_retry(request, &data);
+          if (ack != DAP_TRANSFER_OK)
+          {
+            break;
+          }
+          if ((data & g_match_mask) == match_value)
+          {
+            break;
+          }
+        } while (match_retries++ < g_match_retry);
+
+        if (ack != DAP_TRANSFER_OK)
+        {
+          transfer_response = ack;
+          break;
+        }
+        if ((data & g_match_mask) != match_value)
+        {
+          transfer_response = (uint8_t)(DAP_TRANSFER_OK | 0x10U);
+          break;
+        }
+      }
+      else if ((request & DAP_TRANSFER_APnDP) != 0U)
+      {
+        if (current_ap_posted == 0U)
+        {
+          ack = swd_transfer_retry(request, NULL);
+          if (ack != DAP_TRANSFER_OK)
+          {
+            transfer_response = ack;
+            break;
+          }
+          post_read = 1U;
+        }
       }
       else
       {
-        break;
+        ack = swd_transfer_retry(request, &data);
+        if (ack != DAP_TRANSFER_OK)
+        {
+          transfer_response = ack;
+          break;
+        }
+        if (rsp_off > 60U)
+        {
+          transfer_response = DAP_TRANSFER_ERROR;
+          break;
+        }
+        wr_u32(&resp[rsp_off], data);
+        rsp_off += 4U;
       }
-    } while (tries < g_wait_retry);
 
-    transfer_response = ack;
-
-    if (ack != DAP_TRANSFER_OK)
+      check_write = 0U;
+    }
+    else
     {
-      break;
+      if (post_read != 0U)
+      {
+        uint32_t posted_data = 0U;
+        ack = swd_transfer_retry(SWD_DP_RDBUFF_READ, &posted_data);
+        if (ack != DAP_TRANSFER_OK)
+        {
+          transfer_response = ack;
+          break;
+        }
+        if (rsp_off > 60U)
+        {
+          transfer_response = DAP_TRANSFER_ERROR;
+          break;
+        }
+        wr_u32(&resp[rsp_off], posted_data);
+        rsp_off += 4U;
+        post_read = 0U;
+      }
+
+      if ((request & DAP_TRANSFER_MATCH_MASK) != 0U)
+      {
+        g_match_mask = data;
+        ack = DAP_TRANSFER_OK;
+      }
+      else
+      {
+        ack = swd_transfer_retry(request, &data);
+        if (ack != DAP_TRANSFER_OK)
+        {
+          transfer_response = ack;
+          break;
+        }
+        check_write = 1U;
+      }
     }
 
+    transfer_response = DAP_TRANSFER_OK;
     ++completed;
+  }
 
-    if ((request & DAP_TRANSFER_RnW) != 0U)
+  if (transfer_response == DAP_TRANSFER_OK)
+  {
+    uint8_t ack;
+    if (post_read != 0U)
     {
-      wr_u32(&resp[rsp_off], data);
-      rsp_off += 4U;
+      uint32_t posted_data = 0U;
+      ack = swd_transfer_retry(SWD_DP_RDBUFF_READ, &posted_data);
+      if (ack == DAP_TRANSFER_OK)
+      {
+        if (rsp_off <= 60U)
+        {
+          wr_u32(&resp[rsp_off], posted_data);
+          rsp_off += 4U;
+        }
+        else
+        {
+          ack = DAP_TRANSFER_ERROR;
+        }
+      }
+      transfer_response = ack;
+    }
+    else if (check_write != 0U)
+    {
+      transfer_response = swd_transfer_retry(SWD_DP_RDBUFF_READ, NULL);
     }
   }
 
@@ -747,64 +1026,89 @@ static uint8_t dap_handle_transfer(const uint8_t *req, uint8_t *resp)
 
 static uint8_t dap_handle_transfer_block(const uint8_t *req, uint8_t *resp)
 {
-  uint16_t count = rd_u16(&req[1]);
-  uint8_t request = req[3];
+  uint16_t count = rd_u16(&req[2]);
+  uint8_t request = req[4];
   uint16_t completed = 0U;
   uint8_t transfer_response = DAP_TRANSFER_OK;
   uint16_t i;
-  uint16_t req_off = 4U;
+  uint16_t req_off = 5U;
   uint16_t rsp_off = 4U;
 
   resp[0] = ID_DAP_TransferBlock;
   wr_u16(&resp[1], 0U);
   resp[3] = DAP_TRANSFER_OK;
 
-  for (i = 0U; i < count; ++i)
+  if (count == 0U)
   {
-    uint32_t data = 0U;
-    uint16_t tries = 0U;
-    uint8_t ack;
+    return 4U;
+  }
 
-    if ((request & DAP_TRANSFER_RnW) == 0U)
+  if ((request & DAP_TRANSFER_RnW) != 0U)
+  {
+    if (count > 15U)
     {
-      data = rd_u32(&req[req_off]);
-      req_off += 4U;
+      transfer_response = DAP_TRANSFER_ERROR;
+      goto block_end;
     }
 
-    do
+    if ((request & DAP_TRANSFER_APnDP) != 0U)
     {
-      uint32_t tmp = data;
-      ack = swd_transfer_word(request, &tmp);
-      if ((request & DAP_TRANSFER_RnW) != 0U)
+      transfer_response = swd_transfer_retry(request, NULL);
+      if (transfer_response != DAP_TRANSFER_OK)
       {
-        data = tmp;
+        goto block_end;
       }
-      if (ack == DAP_TRANSFER_WAIT)
+    }
+
+    for (i = 0U; i < count; ++i)
+    {
+      uint32_t data = 0U;
+      uint8_t raw_request = request;
+
+      if (((request & DAP_TRANSFER_APnDP) != 0U) && (i == (uint16_t)(count - 1U)))
       {
-        ++tries;
+        raw_request = SWD_DP_RDBUFF_READ;
       }
-      else
+
+      transfer_response = swd_transfer_retry(raw_request, &data);
+      if (transfer_response != DAP_TRANSFER_OK)
       {
         break;
       }
-    } while (tries < g_wait_retry);
 
-    transfer_response = ack;
-
-    if (ack != DAP_TRANSFER_OK)
-    {
-      break;
-    }
-
-    ++completed;
-
-    if ((request & DAP_TRANSFER_RnW) != 0U)
-    {
       wr_u32(&resp[rsp_off], data);
       rsp_off += 4U;
+      ++completed;
+    }
+  }
+  else
+  {
+    if (count > 14U)
+    {
+      transfer_response = DAP_TRANSFER_ERROR;
+      goto block_end;
+    }
+
+    for (i = 0U; i < count; ++i)
+    {
+      uint32_t data = rd_u32(&req[req_off]);
+      req_off += 4U;
+
+      transfer_response = swd_transfer_retry(request, &data);
+      if (transfer_response != DAP_TRANSFER_OK)
+      {
+        break;
+      }
+      ++completed;
+    }
+
+    if (transfer_response == DAP_TRANSFER_OK)
+    {
+      transfer_response = swd_transfer_retry(SWD_DP_RDBUFF_READ, NULL);
     }
   }
 
+block_end:
   wr_u16(&resp[1], completed);
   resp[3] = transfer_response;
   return (uint8_t)rsp_off;
@@ -872,6 +1176,7 @@ static int8_t CUSTOM_HID_Init_FS(void)
   g_idle_cycles = 0U;
   g_wait_retry = 128U;
   g_match_retry = 0U;
+  g_match_mask = 0xFFFFFFFFUL;
   g_swd_turnaround = 1U;
   g_swd_data_phase = 0U;
   g_swj_clock_hz = 1000000U;
@@ -885,6 +1190,8 @@ static int8_t CUSTOM_HID_Init_FS(void)
 
 static int8_t CUSTOM_HID_DeInit_FS(void)
 {
+  target_nrst_release();
+  swd_line_idle();
   return (USBD_OK);
 }
 

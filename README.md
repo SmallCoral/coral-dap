@@ -2,7 +2,7 @@
 
 一个基于我朋友设计的 **STM32F103** 开发板上的 **STM32F042** 的实验性 **CMSIS-DAP v1 (USB HID)** 调试探针项目。
 
-> 当前定位：**最小可运行的 CMSIS-DAP bring-up / 学习项目**
+> 当前定位：**已在配套硬件上完成 STM32F103CB 连接、读写和烧录验证的 CMSIS-DAP bring-up / 学习项目**
 >
 > 它的目标不是完整复刻官方 DAPLink，而是在资源有限的 STM32F042 上，
 > 尝试实现一个可以被主机识别的 **CMSIS-DAP HID probe**，并通过 GPIO bit-bang 的方式驱动 SWD。
@@ -39,15 +39,19 @@
 - [x] `openocd` 可以识别 probe 并初始化 CMSIS-DAP 接口
 - [x] 已实现基础 CMSIS-DAP v1 命令路径
 - [x] 已加入目标 `nRESET` 控制
+- [x] 已验证读取 STM32F103CB 的 DPIDR、CPUID、DBGMCU ID 和 Flash 容量
+- [x] 已验证 OpenOCD 擦除、烧录、读回校验、复位和断点控制
+- [x] 已修正 SWD ACK 相位、turnaround、AP posted read 和 `DAP_TransferBlock`
+- [x] 附带并实机验证 `F103_Blinky` 闪灯示例
 
 ### 当前限制
 
-- [ ] **尚未验证稳定连接目标 MCU**
-- [ ] **尚未实现完整的 SWD 调试/烧录能力**
 - [ ] **不是完整 DAPLink**
+- [ ] **只声明并验证了 SWD，不提供 JTAG/SWO**
 - [ ] **不包含 MSC/U 盘拖拽烧录**
 - [ ] **不包含 CDC 虚拟串口**
-- [ ] **不保证与所有目标板和主机工具兼容**
+- [ ] **GPIO bit-bang 有效时钟上限限制为 1 MHz，推荐从 100 kHz 开始**
+- [ ] **目前的实机验证对象是配套 STM32F103CB 板，不保证与所有目标板和主机工具兼容**
 
 如果你正在寻找一个“开箱即用、生产可用”的 DAPLink 固件，这个仓库并不是那个目标。
 
@@ -65,7 +69,7 @@
 
 - 不是官方 Arm DAPLink
 - 不是完整的 CMSIS-DAP 固件发行版
-- 不是已经验证稳定的生产级调试器
+- 不是生产级调试器
 - 不是“拖拽烧录器 + 串口 + 调试器”三合一方案
 
 ---
@@ -116,6 +120,11 @@
 │   └── Target/
 ├── cmake/
 │   └── stm32cubemx/
+├── F103_Blinky/
+│   ├── main.c
+│   ├── startup_stm32f103cb.s
+│   ├── STM32F103CB_FLASH.ld
+│   └── CMakeLists.txt
 ├── STM32F042XX_FLASH.ld
 ├── CMakeLists.txt
 └── daplink.cfg
@@ -136,7 +145,7 @@
 
 ### 2. CMSIS-DAP 协议
 
-当前代码实现了一个**最小可识别**的 CMSIS-DAP v1 命令路径，包含但不限于：
+当前代码实现了一个可供 OpenOCD 使用的 CMSIS-DAP v1 命令路径，包含但不限于：
 
 - `DAP_Info`
 - `DAP_Connect`
@@ -164,6 +173,16 @@
 
 因此它本质上是一个 **bit-bang SWD** 实现。
 
+本次修复重点包括：
+
+- 让每个 SWD bit 的周期结束于 SWCLK 高电平，目标在正确边沿返回 ACK
+- 在 turnaround 完成后再切换 SWDIO 输出方向，避免主机与目标争用总线
+- 正确处理 WAIT / FAULT、data phase、parity、idle cycles 和写入 flush
+- 正确实现 AP posted read，并通过 DP `RDBUFF` 取回最后一个 AP 结果
+- 修正 `DAP_TransferBlock` 的包字段偏移和单包边界
+- 修正 HID report descriptor 的实际长度，避免 Windows HID Code 10
+- 避免在 USB 中断回调中调用 `HAL_Delay`
+
 ---
 
 ## 构建
@@ -180,8 +199,8 @@
 ### 构建示例
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --preset Release
+cmake --build --preset Release
 ```
 
 > 说明：
@@ -189,13 +208,45 @@ cmake --build build -j
 > STM32F042 的 Flash 很紧张，建议优先使用 `Release` 或体积优化配置构建。
 > Debug 配置下可能更容易遇到空间不足。
 
+生成文件位于 `build/Release/coral-dap.elf`。
+
+### 构建 STM32F103CB 闪灯示例
+
+确保 `arm-none-eabi-gcc`、CMake 和 Ninja 已加入 `PATH`：
+
+```bash
+cmake -S F103_Blinky -B build/F103_Blinky -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=gcc-arm-none-eabi.cmake \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/F103_Blinky
+```
+
+示例使用复位后的 8 MHz HSI 和 SysTick，每 500 ms 翻转一次 `PB13`。原理图中 `PB13` 通过 Q1（2N7002）驱动 D6/L13，因此高电平点亮 LED。
+
 ---
 
 ## 烧录
 
-你可以使用 ST-Link、OpenOCD 或其他常见方式把生成的 `.elf` / `.bin` 烧录到 STM32F042。
+### 使用外部 CMSIS-DAP 烧录 STM32F042
 
-例如使用 ST-Link / OpenOCD 的常规流程即可。
+`daplink.cfg` 可以通过 `DAP_TARGET=f042` 切换到 F042。只有一个 CMSIS-DAP 时可省略 `DAP_SERIAL`：
+
+```bash
+openocd \
+  -c "set DAP_TARGET f042" \
+  -c "set DAP_SERIAL <external-probe-serial>" \
+  -f daplink.cfg \
+  -c "program build/Release/coral-dap.elf verify reset exit"
+```
+
+### 使用板载 F042 DAP 烧录 STM32F103CB
+
+默认目标就是 F103：
+
+```bash
+openocd -f daplink.cfg \
+  -c "program build/F103_Blinky/f103_blinky.elf verify reset exit"
+```
 
 ---
 
@@ -217,20 +268,26 @@ pyocd list
 ### 3. 检查 OpenOCD 识别
 
 ```bash
-openocd -f interface/cmsis-dap.cfg -f target/stm32f1x.cfg
+openocd -f daplink.cfg \
+  -c "init; reset halt; mdw 0xE000ED00 1; mdw 0xE0042000 1; mdh 0x1FFFF7E0 1; shutdown"
 ```
 
-如果一切顺利，主机侧通常可以看到：
+配套 STM32F103CB 实机验证结果：
 
-- probe 被识别为 CMSIS-DAP
-- HID 接口初始化成功
-- OpenOCD / pyOCD 可以枚举到设备
+- F042 probe firmware：`0.3`
+- SWD DPIDR：`0x1BA01477`
+- Cortex-M3 CPUID：`0x411FC231`
+- DBGMCU IDCODE：`0x20036410`
+- Flash size：`0x0080`，即 128 KiB
 
 ---
 
 ## `daplink.cfg`
 
-仓库附带了一个简单的 OpenOCD 配置文件 `daplink.cfg`，用于快速测试 CMSIS-DAP + SWD 路径。
+仓库附带的 `daplink.cfg` 同时支持两个工作流：
+
+- 默认：使用板载 F042 CMSIS-DAP 调试/烧录 STM32F103CB，速度 100 kHz
+- `DAP_TARGET=f042`：使用外部 CMSIS-DAP 烧录 STM32F042，速度 1 MHz
 
 示例：
 
@@ -242,14 +299,13 @@ openocd -f daplink.cfg
 
 ## 已知问题
 
-- 目标 MCU 连接仍可能失败，例如出现：
-  - `Error connecting DP: cannot read IDR`
-- 某些目标板上，SWD 稳定性仍依赖：
+- 其他目标板上的 SWD 稳定性仍依赖：
   - 目标板实际硬件连接
   - `nRESET` 控制
   - 目标板当前固件是否关闭 SWD/JTAG
   - bit-bang 时序是否合适
-- 主机请求的 SWD 速率与当前 bit-bang 延时之间仍可能不完全匹配
+- 主机请求超过 1 MHz 时，当前固件会把 GPIO bit-bang 有效时钟限制在 1 MHz
+- 目前未实现 SWO、JTAG、CMSIS-DAP packet queue、MSC 和 CDC
 - 该项目更适合学习与实验，不适合直接作为生产工具使用
 
 ---
@@ -258,8 +314,7 @@ openocd -f daplink.cfg
 
 如果未来继续推进，这个项目可以往这些方向演进：
 
-- [ ] 提升 SWD 时序稳定性
-- [ ] 更严格地处理 turnaround / idle / retry
+- [ ] 继续提升高速 SWD 时序稳定性
 - [ ] 适配更多目标 MCU
 - [ ] 增加更可靠的 `nRESET` / connect-under-reset 流程
 - [ ] 补充串口日志或调试输出
