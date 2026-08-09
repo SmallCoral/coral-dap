@@ -62,19 +62,19 @@
   */
 
 /*---------- -----------*/
-#define USBD_MAX_NUM_INTERFACES     64
+#define USBD_MAX_NUM_INTERFACES     1
 /*---------- -----------*/
-#define USBD_MAX_NUM_CONFIGURATION     64
+#define USBD_MAX_NUM_CONFIGURATION     1
 /*---------- -----------*/
-#define USBD_MAX_STR_DESC_SIZ     512
+#define USBD_MAX_STR_DESC_SIZ     128
 /*---------- -----------*/
 #define USBD_DEBUG_LEVEL     0
 /*---------- -----------*/
-#define USBD_SELF_POWERED     1
+#define USBD_SELF_POWERED     0
 /*---------- -----------*/
 #define USBD_CUSTOMHID_OUTREPORT_BUF_SIZE     0x40
 /*---------- -----------*/
-#define USBD_CUSTOM_HID_REPORT_DESC_SIZE     0x40
+#define USBD_CUSTOM_HID_REPORT_DESC_SIZE     0x1B
 /*---------- -----------*/
 #define CUSTOM_HID_FS_BINTERVAL     0x5
 
